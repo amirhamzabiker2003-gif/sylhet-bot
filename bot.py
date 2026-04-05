@@ -1,107 +1,254 @@
 import requests
 from io import BytesIO
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from PIL import Image
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+
+from flask import Flask
+from threading import Thread
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes
+)
 
 TOKEN = "8700889812:AAEgha36C0FPkZ5AFSqGVjrx9MoLZH94my0"
 BASE_URL = "https://esheba.sylhetboard.gov.bd/publicResult/"
 
-# এখানে ইউজার সেশন সেভ রাখার জন্য ডিকশনারি
-user_sessions = {}
+user_data = {}
 
-# ক্যাপচা রিসাইজ ফাংশন (আগের মতোই আছে)
+# ===== FLASK KEEP ALIVE =====
+app_flask = Flask('')
+
+@app_flask.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    app_flask.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+# ===== CAPTCHA RESIZE =====
 def resize_captcha(image_bytes):
     img = Image.open(BytesIO(image_bytes))
     img = img.resize((250, 80))
+    img = img.convert("L")
+
     buffer = BytesIO()
     img.save(buffer, format="PNG")
     buffer.seek(0)
     return buffer
 
+# ===== SAFE GET =====
+def get_value(data, *keys):
+    for key in keys:
+        if key in data and data[key]:
+            return data[key]
+    return ""
+
+# ===== EXTRACT =====
+def extract(soup, keyword):
+    data_dict = {}
+    for table in soup.find_all("table"):
+        if keyword in table.get_text():
+            for row in table.find_all("tr"):
+                cols = row.find_all("td")
+
+                if len(cols) >= 4:
+                    data_dict[cols[0].get_text(strip=True)] = cols[1].get_text(strip=True)
+                    data_dict[cols[2].get_text(strip=True)] = cols[3].get_text(strip=True)
+
+                elif len(cols) == 2:
+                    data_dict[cols[0].get_text(strip=True)] = cols[1].get_text(strip=True)
+
+    return data_dict
+
+# ===== START =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ইউজার স্টার্ট দিলে তার পুরনো ডাটা মুছে নতুন সেশন শুরু হবে
-    user_id = update.effective_user.id
-    if user_id in user_sessions:
-        del user_sessions[user_id]
-        
     keyboard = [["🚀 Start"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text("সিলেট বোর্ড রেজাল্ট বক্সে স্বাগতম!\n\n📥 শুরু করতে নিচের বাটনে চাপ দিন:", reply_markup=reply_markup)
 
+    await update.message.reply_text(
+        "📥 Start চাপ দিয়ে শুরু করো:",
+        reply_markup=reply_markup
+    )
+
+# ===== HANDLE MESSAGE =====
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user_id = update.message.chat_id
     text = update.message.text.strip()
 
     if text == "🚀 Start":
-        # সেশন শুরু করা
+        await update.message.reply_text("📥 তোমার Roll নম্বর দাও:")
+        return
+
+    if user_id not in user_data:
         session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-        
-        # প্রথমে ইনডেক্স পেজ ভিজিট করে কুকি সেট করা
         session.get(BASE_URL + "index.php")
-        
-        user_sessions[user_id] = {
-            "step": "ROLL",
+        captcha = session.get(BASE_URL + "captcha.php")
+
+        user_data[user_id] = {
+            "roll": text,
             "session": session
         }
-        await update.message.reply_text("📥 তোমার রোল নম্বরটি দাও:")
-        return
 
-    if user_id not in user_sessions:
-        await update.message.reply_text("দয়া করে 🚀 Start বাটনে ক্লিক করে শুরু করুন।")
-        return
+        small_img = resize_captcha(captcha.content)
 
-    user_data = user_sessions[user_id]
+        await update.message.reply_photo(
+            photo=small_img,
+            caption="🔐 CAPTCHA লিখো:"
+        )
 
-    # স্টেপ ১: রোল নম্বর নেওয়া এবং ক্যাপচা পাঠানো
-    if user_data["step"] == "ROLL":
-        user_data["roll"] = text
-        user_data["step"] = "CAPTCHA"
-        
-        # ওই একই সেশন ব্যবহার করে ক্যাপচা আনা
-        captcha_res = user_data["session"].get(BASE_URL + "captcha.php")
-        img = resize_captcha(captcha_res.content)
-        
-        await update.message.reply_photo(photo=img, caption="🔐 উপরে ছবিতে থাকা সংখ্যাগুলো (CAPTCHA) লিখো:")
-    
-    # স্টেপ ২: ক্যাপচা ভেরিফাই এবং রেজাল্ট আনা
-    elif user_data["step"] == "CAPTCHA":
-        captcha_code = text
-        session = user_data["session"]
-        
+    else:
+        captcha_text = text
+        data = user_data[user_id]
+
+        loading_msg = await update.message.reply_text(
+            "⏳ একটু অপেক্ষা করো...\nResult আনতেছি..."
+        )
+
         payload = {
-            "hroll": user_data["roll"],
-            "autocaptcha": captcha_code,
+            "hroll": data["roll"],
+            "autocaptcha": captcha_text,
             "btnSubmit": "Submit",
-            "btnaction": "c2hvd1B1YmxpY1Jlc3VsdA==", # Base64 encoded action
-            "param": "MjAyMg==" # 2022 এর জন্য প্যারামিটার (পরিবর্তন করতে পারেন)
+            "btnaction": "c2hvd1B1YmxpY1Jlc3VsdA==",
+            "param": "MjAyMg=="
         }
-        
+
         headers = {
-            "Referer": BASE_URL + "index.php",
-            "Origin": "https://esheba.sylhetboard.gov.bd"
+            "User-Agent": "Mozilla/5.0",
+            "Referer": BASE_URL + "index.php"
         }
 
-        try:
-            res = session.post(BASE_URL + "include/function.php", data=payload, headers=headers)
-            html = res.text
+        res = data["session"].post(
+            BASE_URL + "include/function.php",
+            data=payload,
+            headers=headers
+        )
 
-            if "STUDENT INFORMATION" in html:
-                # এখানে আপনার এক্সট্রাক্ট করা লজিকগুলো আগের মতো থাকবে
-                await update.message.reply_text("✅ রেজাল্ট পাওয়া গেছে! (এখানে রেজাল্ট দেখানোর কোড বসবে)")
-                # সেশন ক্লিয়ার করে দেওয়া
-                del user_sessions[user_id]
-            else:
-                await update.message.reply_text("❌ ভুল ক্যাপচা বা রোল নম্বর! আবার চেষ্টা করতে 🚀 Start দিন।")
-                del user_sessions[user_id]
-        except Exception as e:
-            await update.message.reply_text("⚠️ সার্ভারে সমস্যা হচ্ছে। পরে চেষ্টা করুন।")
-            del user_sessions[user_id]
+        html = res.text
+        await loading_msg.delete()
 
+        if "STUDENT INFORMATION" in html:
+            soup = BeautifulSoup(html, "html.parser")
+
+            for img in soup.find_all("img"):
+                src = img.get("src")
+                if src and ("jpg" in src or "jpeg" in src):
+                    img_url = urljoin(BASE_URL, src)
+                    await update.message.reply_photo(photo=img_url)
+                    break
+
+            student = extract(soup, "STUDENT INFORMATION")
+            hsc = extract(soup, "HSC RESULT")
+
+            name = get_value(student, "Name")
+            father = get_value(student, "Father's Name")
+            mother = get_value(student, "Mother's Name")
+            dob = get_value(student, "Date of Birth")
+            gender = get_value(student, "Gender")
+
+            roll = get_value(hsc, "Roll No")
+            reg = get_value(hsc, "Registration No", "Registration No.")
+            board = get_value(hsc, "Board")
+            group = get_value(hsc, "Group")
+            result = get_value(hsc, "Result")
+            gpa = get_value(hsc, "GPA")
+            institute = get_value(hsc, "Institute")
+
+            msg = (
+                "🧑‍🎓 STUDENT INFORMATION\n"
+                "━━━━━━━━━━━━━━\n\n"
+                f"👤 Name: {name}\n"
+                f"👨 Father: {father}\n"
+                f"👩 Mother: {mother}\n\n"
+                f"📅 DOB: {dob}\n"
+                f"⚧ Gender: {gender}\n\n"
+                "━━━━━━━━━━━━━━\n"
+                "📘 HSC RESULT 2022\n"
+                "━━━━━━━━━━━━━━\n\n"
+                f"🆔 Roll No: {roll}\n"
+                f"📄 Registration No: {reg}\n\n"
+                f"🏫 Board: {board}\n"
+                f"📚 Group: {group}\n\n"
+                f"📊 Result: {result}\n"
+                f"⭐ GPA: {gpa}\n\n"
+                f"🏫 Institute: {institute}"
+            )
+
+            await update.message.reply_text(msg)
+
+            next_roll = int(roll) + 1
+
+            keyboard = [
+                [InlineKeyboardButton(f"➡️ Next ({next_roll})", callback_data=f"next_{next_roll}")]
+            ]
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(
+                "👉 Next করতে নিচের বাটনে চাপ দাও",
+                reply_markup=reply_markup
+            )
+
+        else:
+            await update.message.reply_text("❌ ভুল CAPTCHA বা Roll!")
+
+        del user_data[user_id]
+
+# ===== BUTTON =====
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.message.chat_id
+    data = query.data
+
+    if data.startswith("next_"):
+        next_roll = data.split("_")[1]
+
+        await query.edit_message_text("🔄 Loading...")
+
+        session = requests.Session()
+        session.get(BASE_URL + "index.php")
+        captcha = session.get(BASE_URL + "captcha.php")
+
+        user_data[user_id] = {
+            "roll": next_roll,
+            "session": session
+        }
+
+        small_img = resize_captcha(captcha.content)
+
+        await query.message.reply_text(next_roll)
+
+        await query.message.reply_photo(
+            photo=small_img,
+            caption="🔐 CAPTCHA লিখো:"
+        )
+
+# ===== RUN =====
 if __name__ == "__main__":
+    keep_alive()  # 🔥 IMPORTANT
+
     app = ApplicationBuilder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    print("🤖 Bot Running...")
     app.run_polling()
